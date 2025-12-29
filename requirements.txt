@@ -1,5 +1,5 @@
 streamlit
-QuantLib
+QuantLib-Python
 pandas
 numpy
 matplotlib

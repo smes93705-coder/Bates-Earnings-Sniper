@@ -16,10 +16,10 @@ import requests
 # ==========================================
 # 0. 基礎設定與中文化
 # ==========================================
-st.set_page_config(page_title="Bates 財報狂徒 (完全體)", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Bates 財報狂徒", page_icon="⚡", layout="wide")
 
 # 設定中文字型 (避免圖表亂碼)
-# 根據作業系統自動選擇最佳字體
+# 根據作業系統自動選擇最佳字體，確保雲端與本地都能顯示中文
 system_name = platform.system()
 if system_name == "Windows":
     plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei']
@@ -42,7 +42,8 @@ def get_session():
     """
     s = requests.Session()
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
     })
     return s
 
@@ -51,7 +52,7 @@ def get_session():
 def get_valid_dates(ticker):
     """
     取得該股票所有選擇權到期日
-    優先使用 yfinance，若失敗則切換至 yahooquery
+    優先使用 yfinance，若失敗則自動切換至 yahooquery
     """
     # 嘗試引擎 A: yfinance
     try:
@@ -65,9 +66,8 @@ def get_valid_dates(ticker):
     try:
         t = yq.Ticker(ticker)
         dates = t.options
-        # yahooquery 有時回傳格式不同，需轉換
+        # yahooquery 有時回傳格式不同(dict/list)，需轉換
         if dates and isinstance(dates, dict):
-            # 有些版本回傳 dict
             return list(dates.keys())
         if dates and not isinstance(dates, pd.DataFrame):
             return [str(d) for d in dates]
@@ -81,20 +81,23 @@ def get_valid_dates(ticker):
 def get_market_data(ticker, expiry_date, use_demo=False):
     """
     抓取 Spot Price, Option Chain, 並計算 IV Rank, MA 技術指標
-    含：Demo 模式、雙引擎切換、資料清洗
+    含：Demo 模式、雙引擎切換、資料清洗、EM 計算
     """
     fetch_time = datetime.now(tw_tz).strftime("%Y-%m-%d %H:%M:%S")
 
-    # --- 🧪 Demo 模式 (當 API 全掛時的備援方案) ---
+    # --- 🧪 Demo 模式 (當 API 全掛時的緊急備援方案) ---
     if use_demo:
         spot = 100.0
-        # 模擬一個標準的財報前微笑曲線
-        strikes = np.linspace(80, 120, 20)
-        vols = 0.5 + 0.015 * (strikes - 100) ** 2  # 模擬 IV Smile
+        # 模擬一個標準的財報前微笑曲線 (Smile)
+        strikes = np.linspace(80, 120, 40)
+        # 模擬波動率：價外高，價平低
+        vols = 0.5 + 0.015 * (strikes - 100) ** 2
         prices = []
         for k, v in zip(strikes, vols):
-            # 簡單生成假價格
-            prices.append(max(0.1, (100 - k) * 0.1 + np.random.uniform(1.0, 2.0)))
+            # 簡單生成假價格 (Put)
+            intrinsic = max(0, 100 - k)
+            time_val = (100 * v * 0.1)  # 粗略估計
+            prices.append(intrinsic + time_val * np.exp(-0.1 * abs(k - 100)))
 
         df = pd.DataFrame({
             'Strike': strikes, 'ImpliedVol': vols, 'MarketPrice': prices, 'Type': 'Put'
@@ -115,13 +118,15 @@ def get_market_data(ticker, expiry_date, use_demo=False):
         }
         return spot, df, fetch_time, extra
 
-    # --- 真實數據抓取 ---
+    # --- 真實數據抓取 (Real Data) ---
     spot = None
     puts_df = pd.DataFrame()
     calls_df = pd.DataFrame()
     source_name = "Unknown"
 
-    # 1. 嘗試 yfinance
+    ma20, ma240, hv_current = None, None, 0.4  # 預設值
+
+    # 1. 嘗試 yfinance (主要引擎)
     try:
         stock = yf.Ticker(ticker, session=get_session())
         # 抓取 2 年歷史以計算年線 (MA240)
@@ -134,7 +139,9 @@ def get_market_data(ticker, expiry_date, use_demo=False):
 
             # 清洗與計算 Mid Price
             for d in [puts, calls]:
+                # 補零防呆
                 d.fillna(0, inplace=True)
+                # 計算中價: (Bid+Ask)/2，若無則用 Last
                 d['Mid'] = np.where((d['bid'] > 0) & (d['ask'] > 0), (d['bid'] + d['ask']) / 2, d['lastPrice'])
 
             puts_df = pd.DataFrame(
@@ -144,13 +151,13 @@ def get_market_data(ticker, expiry_date, use_demo=False):
             source_name = "Yahoo Finance (Primary)"
 
             # 計算技術指標
-            ma20 = hist['Close'].rolling(20).mean().iloc[-1]
-            ma240 = hist['Close'].rolling(240).mean().iloc[-1]
+            if len(hist) >= 20: ma20 = hist['Close'].rolling(20).mean().iloc[-1]
+            if len(hist) >= 240: ma240 = hist['Close'].rolling(240).mean().iloc[-1]
             hv_current = np.log(hist['Close'] / hist['Close'].shift(1)).std() * np.sqrt(252)
     except:
         pass
 
-    # 2. 若失敗，嘗試 yahooquery (備援)
+    # 2. 若失敗，嘗試 yahooquery (備援引擎)
     if spot is None or puts_df.empty:
         try:
             t = yq.Ticker(ticker)
@@ -160,14 +167,12 @@ def get_market_data(ticker, expiry_date, use_demo=False):
             # 嘗試抓歷史 (yahooquery history)
             hist = t.history(period='2y')
             if not hist.empty:
-                # yahooquery 回傳 multi-index
                 if isinstance(hist.index, pd.MultiIndex):
                     hist = hist.reset_index().set_index('date')
-                ma20 = hist['close'].rolling(20).mean().iloc[-1]
-                ma240 = hist['close'].rolling(240).mean().iloc[-1]
-                hv_current = np.log(hist['close'] / hist['close'].shift(1)).std() * np.sqrt(252)
-            else:
-                ma20, ma240, hv_current = None, None, 0.4
+                if 'close' in hist.columns:
+                    ma20 = hist['close'].rolling(20).mean().iloc[-1]
+                    ma240 = hist['close'].rolling(240).mean().iloc[-1]
+                    hv_current = np.log(hist['close'] / hist['close'].shift(1)).std() * np.sqrt(252)
 
             # 抓選擇權
             opts = t.option_chain
@@ -199,20 +204,21 @@ def get_market_data(ticker, expiry_date, use_demo=False):
     if spot is None or puts_df.empty:
         return None, None, fetch_time, None
 
-    # --- 計算關鍵指標 ---
-    # Expected Move (EM) = (ATM Call + ATM Put) * 0.85
+    # --- 計算關鍵指標：Expected Move (EM) ---
+    # 公式： (ATM Call + ATM Put) * 0.85
     atm_strike = min(puts_df['Strike'], key=lambda x: abs(x - spot))
     try:
         atm_call = calls_df[calls_df['Strike'] == atm_strike]['Price'].values[0]
         atm_put = puts_df[puts_df['Strike'] == atm_strike]['Price'].values[0]
         em = (atm_call + atm_put) * 0.85
     except:
-        em = spot * 0.05  # Fallback
+        em = spot * 0.05  # Fallback: 若無數據則假設 5%
 
-    # 數據合併與篩選 (保留 50% ~ 150% 範圍，確保紅線能畫)
+    # 數據合併與篩選 (保留 50% ~ 150% 範圍，確保紅線能畫出來)
     df = pd.concat([puts_df[puts_df['Strike'] < spot], calls_df[calls_df['Strike'] > spot]])
     df = df[(df['Strike'] > spot * 0.5) & (df['Strike'] < spot * 1.5)]
-    df = df[(df['Price'] > 0.01)].sort_values('Strike')  # 過濾價格過低
+    # 只保留有成交或有報價的數據，避免雜訊干擾模型
+    df = df[(df['Price'] > 0.01)].sort_values('Strike')
 
     extra = {
         "HV": hv_current,
@@ -240,7 +246,9 @@ class BatesCalibrator:
         self.dividend_ts = ql.YieldTermStructureHandle(
             ql.FlatForward(calculation_date, float(dividend_yield), ql.Actual365Fixed()))
 
-        # Bates 8 參數初始化
+        # 參數初始化 (Bates 模型的 8 個參數)
+        # v0: 當前變異數, theta: 長期均值, kappa: 回歸速度, sigma: Vol of Vol, rho: 相關係數
+        # lambda: 跳躍頻率, nu: 跳躍均值, delta: 跳躍標準差
         self.v0 = 0.04;
         self.theta = 0.04;
         self.kappa = 1.0;
@@ -260,11 +268,11 @@ class BatesCalibrator:
         days = (ql_expiry - self.calculation_date)
         period = ql.Period(max(1, days), ql.Days)
 
-        # 鎖定 V0 (加速運算)
+        # 鎖定 V0 (利用 ATM IV 的平方作為起點，加速收斂)
         try:
             spot_val = self.spot.value()
             closest_idx = (market_data['Strike'] - spot_val).abs().idxmin()
-            val = market_data.loc[closest_idx, 'IV']  # 注意這裡用 IV 欄位
+            val = market_data.loc[closest_idx, 'IV']
             if val > 0: self.v0 = float(val) ** 2; self.theta = self.v0
         except:
             pass
@@ -279,6 +287,7 @@ class BatesCalibrator:
             self.helpers.append(helper)
 
     def cost_function(self, params):
+        # 最小化誤差函數 (RMSE)
         k, s, r, l, n, d = params
         try:
             process = ql.BatesProcess(self.risk_free_ts, self.dividend_ts, self.spot, self.v0, k, self.theta, s, r, l,
@@ -296,13 +305,16 @@ class BatesCalibrator:
             return 1e9
 
     def calibrate(self):
-        # 差分進化演算法
-        bounds = [(0.1, 5.0), (0.01, 2.0), (-0.95, 0.95), (0.01, 5.0), (-0.3, 0.3), (0.01, 0.3)]
+        # 差分進化演算法 (Differential Evolution) 尋找最佳解
+        bounds = [
+            (0.1, 5.0), (0.01, 2.0), (-0.95, 0.95),  # Heston Params
+            (0.01, 5.0), (-0.3, 0.3), (0.01, 0.3)  # Jump Params
+        ]
         try:
             res = differential_evolution(self.cost_function, bounds, strategy='best1bin', maxiter=5, popsize=6, seed=42)
             self.kappa, self.sigma, self.rho, self.lambda_jump, self.nu_jump, self.delta_jump = res.x
         except:
-            pass
+            pass  # 若失敗則沿用初始值
 
         return {
             "v0": self.v0, "kappa": self.kappa, "theta": self.theta, "sigma": self.sigma,
@@ -313,29 +325,29 @@ class BatesCalibrator:
 # ==========================================
 # 3. 風險分析 (Risk Engine)
 # ==========================================
-def analyze_risk(spot, risk_free, dividend, expiry_date, params, option_type, extra_info):
-    ql_expiry = ql.Date(expiry_date.day, expiry_date.month, expiry_date.year)
+def analyze_risk(spot, rf, div, expiry, params, otype, extra):
+    ql_expiry = ql.Date(expiry.day, expiry.month, expiry.year)
     today = ql.Date.todaysDate()
     T = max(1e-4, (ql_expiry - today) / 365.0)
 
     spot_h = ql.QuoteHandle(ql.SimpleQuote(float(spot)))
-    r_ts = ql.YieldTermStructureHandle(ql.FlatForward(today, float(risk_free), ql.Actual365Fixed()))
-    q_ts = ql.YieldTermStructureHandle(ql.FlatForward(today, float(dividend), ql.Actual365Fixed()))
+    r_ts = ql.YieldTermStructureHandle(ql.FlatForward(today, float(rf), ql.Actual365Fixed()))
+    q_ts = ql.YieldTermStructureHandle(ql.FlatForward(today, float(div), ql.Actual365Fixed()))
 
     # Bates 引擎
     proc = ql.BatesProcess(r_ts, q_ts, spot_h, params['v0'], params['kappa'], params['theta'], params['sigma'],
                            params['rho'], params['lambda'], params['nu'], params['delta'])
     eng = ql.BatesEngine(ql.BatesModel(proc))
 
-    # BS 引擎
+    # BS 引擎 (對照組)
     bs_vol = np.sqrt(params['v0'])
     bs_proc = ql.BlackScholesMertonProcess(spot_h, q_ts, r_ts, ql.BlackVolTermStructureHandle(
         ql.BlackConstantVol(today, ql.UnitedStates(ql.UnitedStates.NYSE), bs_vol, ql.Actual365Fixed())))
     bs_eng = ql.AnalyticEuropeanEngine(bs_proc)
 
     results = []
-    # 掃描範圍
-    if option_type == "put":
+    # 掃描範圍設定
+    if otype == "put":
         scan = np.arange(int(spot * 0.6), int(spot), max(1, int(spot * 0.01)))
     else:
         scan = np.arange(int(spot), int(spot * 1.4), max(1, int(spot * 0.01)))
@@ -347,49 +359,47 @@ def analyze_risk(spot, risk_free, dividend, expiry_date, params, option_type, ex
     except:
         disc = 1.0
 
-    for strike in sorted(scan, reverse=(option_type == "put")):
-        pay_p = ql.PlainVanillaPayoff(ql.Option.Put if option_type == "put" else ql.Option.Call,
-                                      float(strike) + delta_k)
-        pay_m = ql.PlainVanillaPayoff(ql.Option.Put if option_type == "put" else ql.Option.Call,
-                                      float(strike) - delta_k)
+    for strike in sorted(scan, reverse=(otype == "put")):
+        p_p = ql.PlainVanillaPayoff(ql.Option.Put if otype == "put" else ql.Option.Call, float(strike) + delta_k)
+        p_m = ql.PlainVanillaPayoff(ql.Option.Put if otype == "put" else ql.Option.Call, float(strike) - delta_k)
         ex = ql.EuropeanExercise(ql_expiry)
 
-        # 機率計算 (Bates vs BS)
-        op_h_p = ql.VanillaOption(pay_p, ex);
+        # 1. Bates 真實機率
+        op_h_p = ql.VanillaOption(p_p, ex);
         op_h_p.setPricingEngine(eng)
-        op_h_m = ql.VanillaOption(pay_m, ex);
+        op_h_m = ql.VanillaOption(p_m, ex);
         op_h_m.setPricingEngine(eng)
         h_prob = abs((op_h_p.NPV() - op_h_m.NPV()) / (2 * delta_k * disc))
 
-        op_b_p = ql.VanillaOption(pay_p, ex);
+        # 2. BS 機率 (虛假機率)
+        op_b_p = ql.VanillaOption(p_p, ex);
         op_b_p.setPricingEngine(bs_eng)
-        op_b_m = ql.VanillaOption(pay_m, ex);
+        op_b_m = ql.VanillaOption(p_m, ex);
         op_b_m.setPricingEngine(bs_eng)
         b_prob = abs((op_b_p.NPV() - op_b_m.NPV()) / (2 * delta_k * disc))
 
-        # Delta
-        d1 = (np.log(spot / strike) + (risk_free - dividend + 0.5 * bs_vol ** 2) * T) / (bs_vol * np.sqrt(T))
-        delta_val = norm.cdf(d1) if option_type == "call" else norm.cdf(d1) - 1
+        # 3. Delta
+        d1 = (np.log(spot / strike) + (rf - div + 0.5 * bs_vol ** 2) * T) / (bs_vol * np.sqrt(T))
+        delta = norm.cdf(d1) if otype == "call" else norm.cdf(d1) - 1
 
-        # 安全分數
-        safe_score = abs((strike - spot) / spot) / extra_info['ExpectedMovePct'] if extra_info[
-                                                                                        'ExpectedMovePct'] > 0 else 0
+        # 4. 安全分數 (EM)
+        safe = abs((strike - spot) / spot) / extra['ExpectedMovePct'] if extra['ExpectedMovePct'] > 0 else 0
 
-        # 評估
+        # 5. 評估邏輯
         status, lvl = "⭕ 普通", 1
         if h_prob > 0.15:
             status, lvl = "💀 危險 (Avoid)", 3
-        elif safe_score < 1.0:
+        elif safe < 1.0:
             status, lvl = "❌ 射程內 (Risky)", 2
-        elif h_prob < 0.08 and safe_score > 1.2:
+        elif h_prob < 0.08 and safe > 1.2:
             status, lvl = "✅ 甜蜜點 (Sweet)", 0
         elif (h_prob - b_prob) > 0.05:
             status, lvl = "⚠️ 肥尾", 2
 
-        results.append({
-            "Strike": strike, "Dist%": (strike - spot) / spot, "Dist(EM)": safe_score,
-            "Delta": delta_val, "BS_Prob": b_prob, "Bates_Prob": h_prob, "Eval": status, "Lvl": lvl
-        })
+        results.append(
+            {"Strike": strike, "Dist%": (strike - spot) / spot, "Dist(EM)": safe, "Delta": delta, "BS_Prob": b_prob,
+             "Bates_Prob": h_prob, "Eval": status, "Lvl": lvl})
+
     return pd.DataFrame(results)
 
 
@@ -407,18 +417,18 @@ with st.sidebar:
         expiry_str = st.selectbox("到期日", dates, index=idx)
         expiry_date = pd.to_datetime(expiry_str)
     else:
-        st.warning("⚠️ 連線緩慢或受阻，可使用演示模式。")
+        st.warning("⚠️ 連線受阻，請嘗試演示模式")
 
     st.markdown("---")
     st.header("⚙️ 2. 環境參數")
-    risk_free = st.number_input("無風險利率", 4.5) / 100
-    div_yield = st.number_input("股利率", 0.0) / 100
+    rf = st.number_input("無風險利率", 4.5) / 100
+    div = st.number_input("股利率", 0.0) / 100
 
-    c_run, c_demo = st.columns(2)
-    with c_run:
-        run_btn = st.button("⚡ 執行分析", type="primary")
-    with c_demo:
-        demo_btn = st.button("🧪 演示模式")
+    c1, c2 = st.columns(2)
+    with c1:
+        run_btn = st.button("⚡ 執行", type="primary")
+    with c2:
+        demo_btn = st.button("🧪 演示")
 
 st.title("⚡ Bates 財報狂徒")
 
@@ -427,55 +437,52 @@ tab1, tab2 = st.tabs(["🚀 戰情室", "📚 戰略手冊"])
 with tab1:
     if (run_btn and expiry_date) or demo_btn:
         is_demo = True if demo_btn else False
-        msg = "正在進行雙核心數據抓取與模型校準..." if not is_demo else "正在生成戰場模擬數據..."
+        msg = "正在使用雙核心引擎連線..." if not is_demo else "正在生成演示數據..."
 
         with st.spinner(msg):
             spot, df_mk, time, extra = get_market_data(ticker, expiry_date, use_demo=is_demo)
 
             if spot:
-                # 顯示來源與狀態
                 st.caption(f"數據時間: {time} | 來源: {extra.get('Source')} | 現價: ${spot:.2f}")
-
-                cal = BatesCalibrator(ql.Date.todaysDate(), spot, risk_free, div_yield)
+                cal = BatesCalibrator(ql.Date.todaysDate(), spot, rf, div)
                 cal.setup_helpers(df_mk, expiry_date)
                 params = cal.calibrate()
 
-                # --- 1. 趨勢判讀 (MA240) ---
+                # --- 1. 趨勢與技術防線 ---
                 st.subheader("🚦 趨勢與技術防線")
-                trend_str = "⚖️ 震盪"
+                trend = "⚖️ 震盪"
                 ma240 = extra.get('MA240')
                 if ma240:
                     if spot > ma240:
-                        trend_str = "📈 長線多頭 (股價 > 年線)"
+                        trend = "📈 多頭 (股價 > 年線)"
                     else:
-                        trend_str = "📉 長線空頭 (股價 < 年線)"
+                        trend = "📉 空頭 (股價 < 年線)"
                     dist_ma = (spot - ma240) / ma240
-                    ma_metrics = f"${ma240:.2f} (乖離: {dist_ma:.1%})"
+                    ma_str = f"${ma240:.2f} (乖離: {dist_ma:.1%})"
                 else:
-                    ma_metrics = "無資料"
+                    ma_str = "無資料"
 
                 c_t1, c_t2, c_t3 = st.columns(3)
-                c_t1.metric("趨勢判讀", trend_str, help="基於年線(MA240)判斷")
-                c_t2.metric("年線 (MA240)", ma_metrics)
-
+                c_t1.metric("趨勢判讀", trend)
+                c_t2.metric("年線 (MA240)", ma_str)
                 # Lambda 警示
                 lam = params['lambda']
                 lam_msg = "✅ 正常" if lam < 1.0 else ("⚠️ 頻繁" if lam < 3.0 else "💀 極度危險")
-                c_t3.metric("跳空強度 (Lambda)", f"{lam:.2f} ({lam_msg})", help="一年發生幾次大跳空？>3.0 為極度危險")
+                c_t3.metric("跳空強度 (Lambda)", f"{lam:.2f} ({lam_msg})")
 
                 # --- 2. 風險指標 ---
                 st.subheader("📊 選擇權風險指標")
                 c1, c2, c3 = st.columns(3)
                 c1.metric("現價", f"${spot:.2f}")
-                c2.metric("IV/HV 比率", f"{extra['ATM_IV'] / max(0.01, extra['HV']):.1f}x", help=">1.2 代表權利金昂貴")
-                c3.metric("市場預期震幅 (EM)", f"±${extra['ExpectedMove']:.2f} ({extra['ExpectedMovePct']:.1%})",
+                c2.metric("EM (預期震幅)", f"±${extra['ExpectedMove']:.2f} ({extra['ExpectedMovePct']:.1%})",
                           help="莊家防守線")
+                c3.metric("ATM IV", f"{extra['ATM_IV']:.1%}")
 
-                # --- 3. 微笑曲線 ---
+                # --- 3. 微笑曲線圖表 ---
                 st.subheader("1. 波動率微笑 (Bates Fit)")
                 fig, ax = plt.subplots(figsize=(10, 4))
-                ax.plot(df_mk['Strike'], df_mk['IV'], 'bo', alpha=0.5, label='Market IV')
-                ax.axvline(spot + extra['ExpectedMove'], color='gray', linestyle='--', label='EM 邊界')
+                ax.plot(df_mk['Strike'], df_mk['IV'], 'bo', alpha=0.5, label='Market IV (市場數據)')
+                ax.axvline(spot + extra['ExpectedMove'], color='gray', linestyle='--', label='EM 邊界 (危險區)')
                 ax.axvline(spot - extra['ExpectedMove'], color='gray', linestyle='--')
 
                 # 紅線修復 (Interpolation)
@@ -503,7 +510,7 @@ with tab1:
                     except:
                         m_v.append(np.nan)
 
-                ax.plot(m_k, pd.Series(m_v).interpolate(limit_direction='both'), 'r-', label='Bates Fit')
+                ax.plot(m_k, pd.Series(m_v).interpolate(limit_direction='both'), 'r-', label='Bates Model (理論)')
                 ax.set_xlabel("履約價 (Strike)")
                 ax.set_ylabel("隱含波動率 (IV)")
                 ax.legend();
@@ -523,20 +530,31 @@ with tab1:
 
                 t1, t2 = st.tabs(["Short Put", "Short Call"])
                 with t1:
-                    df = analyze_risk(spot, risk_free, div_yield, expiry_date, params, "put", extra)
+                    df = analyze_risk(spot, rf, div, expiry_date, params, "put", extra)
                     st.dataframe(df.style.apply(c_risk, axis=1).format(
                         {"Dist%": "{:.1%}", "Dist(EM)": "{:.1f}x", "Delta": "{:.2f}", "BS_Prob": "{:.1%}",
                          "Bates_Prob": "{:.1%}"}), use_container_width=True)
                 with t2:
-                    df = analyze_risk(spot, risk_free, div_yield, expiry_date, params, "call", extra)
+                    df = analyze_risk(spot, rf, div, expiry_date, params, "call", extra)
                     st.dataframe(df.style.apply(c_risk, axis=1).format(
                         {"Dist%": "{:.1%}", "Dist(EM)": "{:.1f}x", "Delta": "{:.2f}", "BS_Prob": "{:.1%}",
                          "Bates_Prob": "{:.1%}"}), use_container_width=True)
             else:
-                st.error("無法取得數據，請使用演示模式或稍後再試。")
+                st.error("無法取得數據，請使用演示模式。")
 
 with tab2:
     st.header("📚 戰略指導手冊")
+
+    st.markdown("### 🚦 趨勢判讀與操作心法")
+    st.markdown("""
+    **如何判斷目前趨勢？**
+    * **多頭 (Bull)**：當 **股價 > 年線 (MA240)**。這代表過去一年的平均持倉者都是賺錢的，下方有強力支撐。
+        * **策略**：大膽做 **Short Put**。可以稍微激進一點選 Delta 0.15~0.2 的位置。
+    * **空頭 (Bear)**：當 **股價 < 年線 (MA240)**。代表上方有層層套牢賣壓。
+        * **策略**：做 **Short Put** 時務必保守！安全距離請拉大 (Dist > 1.5 EM)。或者考慮改做 Bear Call Spread。
+    """)
+
+    st.markdown("---")
 
     with st.expander("⚡ 極速下單流程 (省時版 S.O.P.)", expanded=True):
         col_s1, col_s2, col_s3, col_s4 = st.columns(4)
@@ -545,7 +563,7 @@ with tab2:
             st.write("輸入代碼，查看 **Bates 機率 < 5%** 的履約價是哪一個？(例: $90 Put)")
         with col_s2:
             st.markdown("#### Step 2: 護城河 (EM)")
-            st.write("檢查該履約價是否距離現價超過 **紅線虛線 (EM)**？(Dist(EM) > 1.2)")
+            st.write("檢查該履約價是否距離現價超過 **紅線虛線 (Expected Move)**？(Dist(EM) > 1.2)")
         with col_s3:
             st.markdown("#### Step 3: 防線")
             st.write("檢查該履約價是否在 **年線 (MA240)** 之下？如果在年線下，安全性倍增。")
