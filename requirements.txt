@@ -1,0 +1,8 @@
+streamlit
+QuantLib
+pandas
+numpy
+matplotlib
+yfinance
+scipy
+pytz
