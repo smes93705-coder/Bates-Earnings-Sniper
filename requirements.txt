@@ -4,6 +4,8 @@ pandas
 numpy
 matplotlib
 yfinance>=0.2.40
+yahooquery
 scipy
 pytz
 requests
+lxml
