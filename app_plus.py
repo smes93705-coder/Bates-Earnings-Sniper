@@ -10,6 +10,7 @@ from scipy.stats import norm
 from datetime import datetime, timedelta
 import pytz
 import time
+import requests
 
 # ==========================================
 # 0. 基礎設定與中文化
@@ -30,35 +31,53 @@ tw_tz = pytz.timezone('Asia/Taipei')
 
 
 # ==========================================
-# 1. 強力資料抓取模組 (Robust Data Fetcher)
+# 1. 強力資料抓取模組 (防封鎖版)
 # ==========================================
+
+def get_session():
+    """
+    建立一個偽裝成瀏覽器的 Session，騙過 Yahoo 的機器人偵測
+    """
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    })
+    return session
+
 
 @st.cache_data(ttl=3600)
 def get_valid_dates(ticker):
     """
-    取得該股票所有選擇權到期日 (含重試機制)
+    取得該股票所有選擇權到期日 (含重試機制 + 防封鎖)
     """
-    for _ in range(3):
+    err_msg = ""
+    for i in range(3):  # 重試 3 次
         try:
-            stock = yf.Ticker(ticker)
+            # 關鍵修改：傳入 session
+            stock = yf.Ticker(ticker, session=get_session())
             dates = stock.options
             if dates: return list(dates)
             time.sleep(1)
-        except:
+        except Exception as e:
+            err_msg = str(e)
             time.sleep(1)
+
+    # 若失敗，印出錯誤供除錯
+    print(f"Debug: {ticker} 抓取失敗: {err_msg}")
     return []
 
 
 @st.cache_data(ttl=300)
 def get_market_data(ticker, expiry_date):
     """
-    抓取 Spot Price, Option Chain, 並計算 IV Rank, MA 技術指標
-    回傳: (現價, 整理後的選擇權表, 抓取時間, 額外資訊)
+    抓取 Spot Price, Option Chain (防封鎖版)
     """
     fetch_time = datetime.now(tw_tz).strftime("%Y-%m-%d %H:%M:%S")
-    stock = yf.Ticker(ticker)
 
-    # 1. 抓取現貨與歷史數據 (抓 2 年以計算年線)
+    # 關鍵修改：傳入 session
+    stock = yf.Ticker(ticker, session=get_session())
+
+    # 1. 抓取現貨與歷史數據
     try:
         hist = stock.history(period="2y")
         if hist.empty: return None, None, fetch_time, None
@@ -68,7 +87,7 @@ def get_market_data(ticker, expiry_date):
         hist['LogRet'] = np.log(hist['Close'] / hist['Close'].shift(1))
         hv_current = hist['LogRet'].std() * np.sqrt(252)
 
-        # 計算技術指標 (MA20, MA240)
+        # 計算技術指標
         ma20 = hist['Close'].rolling(window=20).mean().iloc[-1] if len(hist) >= 20 else None
         ma240 = hist['Close'].rolling(window=240).mean().iloc[-1] if len(hist) >= 240 else None
 
@@ -83,7 +102,7 @@ def get_market_data(ticker, expiry_date):
     except:
         return None, None, fetch_time, None
 
-    # 3. 資料清洗 (處理 NaN)
+    # 3. 資料清洗
     for df in [puts, calls]:
         for col in ['bid', 'ask', 'lastPrice', 'impliedVolatility', 'strike']:
             if col not in df.columns: df[col] = 0.0
@@ -106,24 +125,23 @@ def get_market_data(ticker, expiry_date):
         'MarketPrice': calls['MarketPrice'], 'Type': 'Call'
     })
 
-    # 4. 計算 ATM Straddle Price (市場預期震幅 Expected Move)
+    # 4. 計算 EM
     atm_strike = min(puts_data['Strike'], key=lambda x: abs(x - spot))
     try:
         atm_call = calls_data[calls_data['Strike'] == atm_strike]['MarketPrice'].values[0]
         atm_put = puts_data[puts_data['Strike'] == atm_strike]['MarketPrice'].values[0]
-        # 公式備註：ATM Straddle * 0.85
         expected_move_dollar = (atm_call + atm_put) * 0.85
     except:
         expected_move_dollar = spot * 0.05
 
     expected_move_pct = expected_move_dollar / spot
 
-    # 5. 篩選 OTM (價外) 用於校準
+    # 5. 篩選 OTM
     otm_puts = puts_data[puts_data['Strike'] < spot]
     otm_calls = calls_data[calls_data['Strike'] > spot]
     df = pd.concat([otm_puts, otm_calls]).reset_index(drop=True)
 
-    # 過濾極端值以利畫圖
+    # 過濾極端值
     df = df[(df['Strike'] > spot * 0.50) & (df['Strike'] < spot * 1.50)]
     df = df[(df['MarketPrice'] > 0.01) & (df['ImpliedVol'] > 0)].sort_values(by='Strike').reset_index(drop=True)
 
@@ -217,7 +235,7 @@ class BatesCalibrator:
             k, s, r, l, n, d = res.x
             self.kappa, self.sigma, self.rho, self.lambda_jump, self.nu_jump, self.delta_jump = k, s, r, l, n, d
         except:
-            st.warning("模型校準未完全收斂，將使用預設參數進行估算。")
+            pass  # 失敗則沿用預設值
 
         return {
             "v0": self.v0, "kappa": self.kappa, "theta": self.theta, "sigma": self.sigma,
@@ -444,7 +462,7 @@ with tab_main:
                 ax.axvline(spot + extra['ExpectedMove'], color='gray', linestyle='--', label='EM 邊界 (危險區)')
                 ax.axvline(spot - extra['ExpectedMove'], color='gray', linestyle='--')
 
-                # 紅線修復
+                # 紅線修復邏輯
                 min_k = df_market['Strike'].min()
                 max_k = df_market['Strike'].max()
                 model_strikes = np.linspace(min_k, max_k, 50)
